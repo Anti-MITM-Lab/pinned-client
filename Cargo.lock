@@ -924,7 +924,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pinned-client"
-version = "0.6.4"
+version = "0.6.8"
 dependencies = [
  "base64 0.22.1",
  "clap",

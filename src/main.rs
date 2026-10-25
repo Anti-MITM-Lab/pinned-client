@@ -1,12 +1,13 @@
 use base64::Engine;
 use clap::Parser;
 use futures_util::StreamExt;
-use reqwest::Client;
+use reqwest::{Client, Proxy};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -23,9 +24,10 @@ struct PinnedConfig {
     pin: String,
     #[serde(default)]
     expiry: Option<u64>,
-    // 新增：客户端专属暗号
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 const CONFIG_PATH: &str = "pinned-config.json";
@@ -39,9 +41,10 @@ struct Args {
     ip: Option<String>,
     #[arg(short, long)]
     pin: Option<String>,
-    // 新增：命令行支持传入 token
     #[arg(short, long)]
     token: Option<String>,
+    #[arg(short = 'x', long)]
+    proxy: Option<String>,
     #[arg(long, hide = true)]
     dev: bool,
 }
@@ -99,13 +102,10 @@ impl PinnedVerifier {
     fn extract_cert_info(cert_der: &[u8]) -> Result<(Vec<u8>, u64), Error> {
         let (_, cert) = X509Certificate::from_der(cert_der)
             .map_err(|e| Error::General(format!("X509 parse error: {e}")))?;
-
         println!("[!] 捕获到证书 Issuer: {}", cert.issuer);
-
         let spki_der = cert.tbs_certificate.subject_pki.raw.to_vec();
         let not_after = cert.tbs_certificate.validity.not_after;
         let expiry_ts = not_after.timestamp() as u64;
-
         Ok((spki_der, expiry_ts))
     }
 }
@@ -120,7 +120,6 @@ impl ServerCertVerifier for PinnedVerifier {
         _now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         let (spki_der, expiry_ts) = Self::extract_cert_info(end_entity.as_ref())?;
-
         let mut hasher = Sha256::new();
         hasher.update(&spki_der);
         let actual_hash = hasher.finalize();
@@ -185,19 +184,81 @@ impl ServerCertVerifier for PinnedVerifier {
     }
 }
 
-// ==================== 4. 配置文件读写 ====================
-fn load_config() -> Option<PinnedConfig> {
-    fs::read_to_string(CONFIG_PATH)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
+// ==================== 4. 智能 DNS 解析器 (DoH) ====================
+async fn resolve_via_doh(
+    domain: &str,
+    proxy_url: Option<&str>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut builder = Client::builder();
+
+    // 默认使用 Cloudflare 的 DoH
+    let mut doh_url = format!(
+        "https://cloudflare-dns.com/dns-query?ct=application/dns-json&name={}&type=A",
+        domain
+    );
+    let mut bind_host = "cloudflare-dns.com";
+    let mut bind_ip = "1.1.1.1:443";
+
+    if let Some(proxy_str) = proxy_url {
+        let proxy = Proxy::all(proxy_str)?;
+        builder = builder.proxy(proxy);
+        println!("[*] 检测到代理，DNS 请求将通过代理发往 Cloudflare DoH...");
+    } else {
+        doh_url = format!("https://dns.alidns.com/resolve?name={}&type=A", domain);
+        bind_host = "dns.alidns.com";
+        bind_ip = "223.5.5.5:443";
+        println!("[*] 无代理，使用阿里 DoH 直连解析...");
+    }
+
+    let addr: SocketAddr = bind_ip.parse()?;
+    builder = builder.resolve(bind_host, addr);
+
+    let client = builder.build()?;
+
+    let resp: Value = client
+        .get(&doh_url)
+        .header("Accept", "application/dns-json")
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let mut ips = Vec::new();
+    if let Some(answers) = resp["Answer"].as_array() {
+        for ans in answers {
+            if let Some(ip) = ans["data"].as_str() {
+                let type_id = ans["type"].as_u64().unwrap_or(0);
+                if type_id == 1 || type_id == 28 {
+                    // 自动补全端口
+                    ips.push(format!("{}:443", ip));
+                }
+            }
+        }
+    }
+    Ok(ips)
 }
 
-fn resolve_dns_ip(domain: &str) -> Vec<String> {
+fn resolve_dns_ip_system(domain: &str) -> Vec<String> {
     let target = format!("{}:443", domain);
     match target.to_socket_addrs() {
         Ok(addrs) => addrs.map(|addr| addr.to_string()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+async fn smart_resolve(domain: &str, proxy: Option<&str>) -> Vec<String> {
+    match resolve_via_doh(domain, proxy).await {
+        Ok(ips) if !ips.is_empty() => return ips,
+        _ => println!("[-] DoH 解析失败，降级到系统 DNS"),
+    }
+    resolve_dns_ip_system(domain)
+}
+
+// ==================== 5. 配置文件读写与工具 ====================
+fn load_config() -> Option<PinnedConfig> {
+    fs::read_to_string(CONFIG_PATH)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
 }
 
 fn save_config(cfg: &PinnedConfig) {
@@ -257,7 +318,7 @@ fn build_client_with_verifier(
     if let Some(ip_str) = ip {
         let target_addr: SocketAddr = ip_str
             .parse()
-            .map_err(|_| "无效的 IP 格式，请使用 IP:端口 的格式")?;
+            .map_err(|_| format!("无效的 IP 格式: {}，请使用 IP:端口 的格式", ip_str))?;
         client_builder = client_builder.resolve(domain, target_addr);
     }
 
@@ -265,7 +326,7 @@ fn build_client_with_verifier(
     Ok((client, verifier))
 }
 
-// ==================== 5. 响应处理 ====================
+// ==================== 6. 响应处理 ====================
 async fn process_response(
     resp: Result<reqwest::Response, reqwest::Error>,
     captured: Option<(String, u64)>,
@@ -273,11 +334,11 @@ async fn process_response(
     ip: &str,
     is_first_run: bool,
     token: Option<String>,
+    proxy: Option<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match resp {
         Ok(response) => {
             let status = response.status();
-
             let mut preview = Vec::new();
             let mut stream = response.bytes_stream();
 
@@ -308,7 +369,8 @@ async fn process_response(
                         ip: Some(ip.to_string()),
                         pin: actual_pin,
                         expiry: Some(expiry_ts),
-                        token: token.clone(), // 保存暗号到配置文件
+                        token: token.clone(),
+                        proxy: proxy.clone(),
                     };
                     save_config(&cfg);
                 } else {
@@ -328,7 +390,7 @@ async fn process_response(
     }
 }
 
-// ==================== 6. 主函数 ====================
+// ==================== 7. 主函数 ====================
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -344,22 +406,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = load_config();
 
-    let domain = args
+    // 修复：不要 panic，改用优雅的错误提示
+    let domain = match args
         .domain
         .clone()
         .or_else(|| config.as_ref().map(|c| c.domain.clone()))
-        .expect("缺少目标域名，请通过 -d 提供或配置 pinned-config.json");
+    {
+        Some(d) => d,
+        None => {
+            println!("[-] 缺少目标域名，请通过 -d 提供或配置 pinned-config.json");
+            return Ok(());
+        }
+    };
 
     let current_ip = args
         .ip
         .clone()
         .or_else(|| config.as_ref().and_then(|c| c.ip.clone()));
 
-    // 解析 Token：命令行 > 配置文件 > 空
     let token = args
         .token
         .clone()
         .or_else(|| config.as_ref().and_then(|c| c.token.clone()));
+
+    let proxy = args
+        .proxy
+        .clone()
+        .or_else(|| config.as_ref().and_then(|c| c.proxy.clone()));
 
     let (pin_str, is_first_run) = if let Some(cmd_pin) = &args.pin {
         (cmd_pin.clone(), false)
@@ -377,29 +450,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (client, verifier) = build_client_with_verifier(&domain, Some(ip_str), &pin_str)?;
 
         let mut req = client.get(&url);
-        // 核心修改：如果有 token，就带上自定义 Header
         if let Some(t) = &token {
             req = req.header("X-Probe-Token", t);
         }
 
         let resp = req.send().await;
+        let captured = verifier.captured_data.lock().ok().and_then(|g| g.clone());
 
-        let captured = {
-            match verifier.captured_data.lock() {
-                Ok(guard) => guard.clone(),
-                Err(_) => None,
-            }
-        };
-
-        if process_response(resp, captured, &domain, ip_str, is_first_run, token.clone()).await? {
+        if process_response(
+            resp,
+            captured,
+            &domain,
+            ip_str,
+            is_first_run,
+            token.clone(),
+            proxy.clone(),
+        )
+        .await?
+        {
             return Ok(());
         }
         println!("[!] 强绑 IP 连接失败, 正在尝试 DNS 降级解析...");
     }
 
-    // ==================== 第二阶段：DNS 降级 ====================
-    println!("[*] 尝试通过 DNS 解析 {} 的新 IP...", domain);
-    let new_ips = resolve_dns_ip(&domain);
+    // ==================== 第二阶段：智能 DNS 降级 ====================
+    println!("[*] 尝试通过智能 DoH 解析 {} 的新 IP...", domain);
+    let new_ips = smart_resolve(&domain, proxy.as_deref()).await;
 
     if new_ips.is_empty() {
         println!("[-] DNS 解析失败，无法降级。");
@@ -426,13 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let resp = req.send().await;
-
-        let captured = {
-            match verifier.captured_data.lock() {
-                Ok(guard) => guard.clone(),
-                Err(_) => None,
-            }
-        };
+        let captured = verifier.captured_data.lock().ok().and_then(|g| g.clone());
 
         if process_response(
             resp,
@@ -441,6 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ip_candidate,
             is_first_run,
             token.clone(),
+            proxy.clone(),
         )
         .await?
         {

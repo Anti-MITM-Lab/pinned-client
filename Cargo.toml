@@ -1,10 +1,10 @@
 [package]
 name = "pinned-client"
-version = "0.6.4"
+version = "0.6.8"
 edition = "2021"
 
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2","stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2","stream","json"] }
 rustls = "0.23"
 tokio = { version = "1", features = ["full"] }
 sha2 = "0.10"
