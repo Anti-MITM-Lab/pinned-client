@@ -1,0 +1,26 @@
+[package]
+name = "pinned-client"
+version = "0.6.4"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2","stream"] }
+rustls = "0.23"
+tokio = { version = "1", features = ["full"] }
+sha2 = "0.10"
+base64 = "0.22"
+x509-parser = "0.16"
+windows = { version = "0.62",features = ["default","Win32_Foundation","Win32_System_Diagnostics_Debug","Win32_System_Threading"]}
+clap = { version = "4.6.7", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+futures-util = "0.3.34"
+
+[profile.release]
+lto = "thin"
+debug-assertions = false
+debug = false
+opt-level = "z"
+panic = "abort"
+overflow-checks = false
+
