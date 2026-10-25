@@ -1,6 +1,6 @@
 use base64::Engine;
 use clap::Parser;
-use futures_util::StreamExt; // 移到顶部
+use futures_util::StreamExt;
 use reqwest::Client;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use x509_parser::prelude::*;
 
+// ==================== 1. 配置文件结构 ====================
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct PinnedConfig {
     domain: String,
@@ -22,6 +23,9 @@ struct PinnedConfig {
     pin: String,
     #[serde(default)]
     expiry: Option<u64>,
+    // 新增：客户端专属暗号
+    #[serde(default)]
+    token: Option<String>,
 }
 
 const CONFIG_PATH: &str = "pinned-config.json";
@@ -35,10 +39,14 @@ struct Args {
     ip: Option<String>,
     #[arg(short, long)]
     pin: Option<String>,
+    // 新增：命令行支持传入 token
+    #[arg(short, long)]
+    token: Option<String>,
     #[arg(long, hide = true)]
     dev: bool,
 }
 
+// ==================== 2. 反调试逻辑 ====================
 #[cfg(target_os = "windows")]
 fn is_being_debugged() -> bool {
     use windows::core::BOOL;
@@ -68,6 +76,7 @@ fn is_being_debugged() -> bool {
     false
 }
 
+// ==================== 3. 证书校验器 ====================
 #[derive(Debug)]
 struct PinnedVerifier {
     expected_hash: Vec<u8>,
@@ -117,7 +126,6 @@ impl ServerCertVerifier for PinnedVerifier {
         let actual_hash = hasher.finalize();
         let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual_hash);
 
-        // 安全写入 Mutex，如果锁坏了也不 panic
         if let Ok(mut lock) = self.captured_data.lock() {
             *lock = Some((actual_b64.clone(), expiry_ts));
         }
@@ -177,6 +185,7 @@ impl ServerCertVerifier for PinnedVerifier {
     }
 }
 
+// ==================== 4. 配置文件读写 ====================
 fn load_config() -> Option<PinnedConfig> {
     fs::read_to_string(CONFIG_PATH)
         .ok()
@@ -256,12 +265,14 @@ fn build_client_with_verifier(
     Ok((client, verifier))
 }
 
+// ==================== 5. 响应处理 ====================
 async fn process_response(
     resp: Result<reqwest::Response, reqwest::Error>,
     captured: Option<(String, u64)>,
     domain: &str,
     ip: &str,
     is_first_run: bool,
+    token: Option<String>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match resp {
         Ok(response) => {
@@ -270,7 +281,6 @@ async fn process_response(
             let mut preview = Vec::new();
             let mut stream = response.bytes_stream();
 
-            // 安全读取前 64 字节
             while preview.len() < 64 {
                 match stream.next().await {
                     Some(Ok(chunk)) => {
@@ -298,6 +308,7 @@ async fn process_response(
                         ip: Some(ip.to_string()),
                         pin: actual_pin,
                         expiry: Some(expiry_ts),
+                        token: token.clone(), // 保存暗号到配置文件
                     };
                     save_config(&cfg);
                 } else {
@@ -310,13 +321,14 @@ async fn process_response(
             let error_msg = e.to_string();
             if error_msg.contains("Certificate pin mismatch") {
                 println!("[-] 连接失败: {}", e);
-                return Ok(true); // 遇到 MITM，结束整个探测流
+                return Ok(true);
             }
             Ok(false)
         }
     }
 }
 
+// ==================== 6. 主函数 ====================
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -343,6 +355,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .or_else(|| config.as_ref().and_then(|c| c.ip.clone()));
 
+    // 解析 Token：命令行 > 配置文件 > 空
+    let token = args
+        .token
+        .clone()
+        .or_else(|| config.as_ref().and_then(|c| c.token.clone()));
+
     let (pin_str, is_first_run) = if let Some(cmd_pin) = &args.pin {
         (cmd_pin.clone(), false)
     } else if let Some(cfg) = &config {
@@ -353,27 +371,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let url = format!("https://{}/", domain);
 
-    // ==================== 第一阶段：尝试强绑 IP ====================
+    // ==================== 第一阶段：强绑 IP ====================
     if let Some(ip_str) = &current_ip {
         println!("[*] 探测目标: {} -> {}", domain, ip_str);
         let (client, verifier) = build_client_with_verifier(&domain, Some(ip_str), &pin_str)?;
-        let resp = client.get(&url).send().await;
 
-        // 核心修复：用独立作用域获取 clone，避免借用逃逸
+        let mut req = client.get(&url);
+        // 核心修改：如果有 token，就带上自定义 Header
+        if let Some(t) = &token {
+            req = req.header("X-Probe-Token", t);
+        }
+
+        let resp = req.send().await;
+
         let captured = {
             match verifier.captured_data.lock() {
                 Ok(guard) => guard.clone(),
-                Err(_) => None, // 如果锁中毒，直接当 None 处理
+                Err(_) => None,
             }
         };
 
-        if process_response(resp, captured, &domain, ip_str, is_first_run).await? {
+        if process_response(resp, captured, &domain, ip_str, is_first_run, token.clone()).await? {
             return Ok(());
         }
         println!("[!] 强绑 IP 连接失败, 正在尝试 DNS 降级解析...");
     }
 
-    // ==================== 第二阶段：DNS 动态降级与多 IP 轮询 ====================
+    // ==================== 第二阶段：DNS 降级 ====================
     println!("[*] 尝试通过 DNS 解析 {} 的新 IP...", domain);
     let new_ips = resolve_dns_ip(&domain);
 
@@ -396,7 +420,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-        let resp = client.get(&url).send().await;
+        let mut req = client.get(&url);
+        if let Some(t) = &token {
+            req = req.header("X-Probe-Token", t);
+        }
+
+        let resp = req.send().await;
 
         let captured = {
             match verifier.captured_data.lock() {
@@ -405,7 +434,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        if process_response(resp, captured, &domain, &ip_candidate, is_first_run).await? {
+        if process_response(
+            resp,
+            captured,
+            &domain,
+            &ip_candidate,
+            is_first_run,
+            token.clone(),
+        )
+        .await?
+        {
             return Ok(());
         }
     }
