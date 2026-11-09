@@ -43,9 +43,10 @@ async fn main() -> ExitCode {
     // rustls 0.23 要求显式安装加密后端；重复安装会报错，忽略即可。
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    #[cfg(target_os = "windows")]
+    // 反调试只在 Windows 上生效，其余平台该函数恒返回 false。
+    // 这里不加 cfg，避免非 Windows 构建把它判成 dead_code（clippy -D warnings 会挂）。
     if !args.dev && antidebug::is_being_debugged() {
-        // 被调试时静默退出，避免指针/配置被直接 dump。
+        // 被调试时静默退出，避免内存里的暗号与配置被直接 dump。
         std::process::exit(0);
     }
 
