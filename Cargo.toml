@@ -1,6 +1,6 @@
 [package]
 name = "pinned-client"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2021"
 description = "对抗 TLS 中间人的证书指纹探针：TOFU 固定 SPKI，指纹变化即告警"
 license = "MIT"
