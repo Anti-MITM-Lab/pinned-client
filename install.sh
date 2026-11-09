@@ -55,7 +55,7 @@ pinned-client 安装脚本
       --token <暗号>    友军暗号，写入配置
   -x, --proxy <URL>     DoH 代理，写入配置
       --config <路径>   配置文件路径，默认 /etc/pinned-client/pinned-config.json
-      --version <ver>   安装指定版本（如 0.7.0），默认 latest
+      --version <ver>   安装指定版本（如 0.8.0），默认 latest
       --prefix <dir>    安装前缀，默认 /usr/local
       --mirror <url>    GitHub 下载加速前缀，如 https://ghproxy.net/
       --binary <path>   使用本地已编译好的二进制（离线安装）

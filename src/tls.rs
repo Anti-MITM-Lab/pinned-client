@@ -186,9 +186,10 @@ pub fn build_client(
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
 
+    // 注意：reqwest 0.13 移除了 `tls_built_in_root_certs`；这里传入的是完全自定义的
+    // TLS 配置，本来就不会使用内置根证书。
     Client::builder()
         .use_preconfigured_tls(tls_config)
-        .tls_built_in_root_certs(false)
         .no_proxy()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())

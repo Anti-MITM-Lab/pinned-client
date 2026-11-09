@@ -1,31 +1,31 @@
 [package]
 name = "pinned-client"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "对抗 TLS 中间人的证书指纹探针：TOFU 固定 SPKI，指纹变化即告警"
 license = "MIT"
 readme = "README.md"
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23.1"
 clap = { version = "4.6.7", features = ["derive"] }
 futures-util = "0.3.34"
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "rustls",
     "http2",
     "stream",
     "json",
 ] }
-rustls = "0.23"
+rustls = "0.23.46"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-sha2 = "0.10"
-tokio = { version = "1", features = ["full"] }
-x509-parser = "0.16"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["full"] }
+x509-parser = "0.18.1"
 
 # 反调试只在 Windows 上编译；放在 target 下，Linux 构建不会拖入 windows crate。
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = [
+windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Threading",
