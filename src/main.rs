@@ -1,524 +1,261 @@
-use base64::Engine;
+//! 对抗 TLS 中间人的证书指纹探针。
+//!
+//! 工作方式：首次运行采用 TOFU（首次使用即信任）记录目标站点的 SPKI 指纹，
+//! 之后每次连接都校验指纹；指纹变化即判定链路被中间人劫持。
+//!
+//! 模块划分：
+//!
+//! | 模块 | 职责 |
+//! |------|------|
+//! | `cli` | 命令行参数 |
+//! | `config` | `pinned-config.json` 的查找、读写与校验 |
+//! | `tls` | 自定义证书校验器（SPKI 固定）、HTTP 客户端构建 |
+//! | `dns` | DoH / 系统 DNS 解析 |
+//! | `probe` | 单次探测流程与结果模型 |
+//! | `report` | 人类可读与 JSON 输出、退出码 |
+//! | `antidebug` | Windows 反调试（可选） |
+//!
+//! 退出码：`0` 正常 / `2` 检测到 MITM / `3` 全部候选不可达 /
+//! `4` 用法或配置错误 / `5` 证书过期（仅 `--fail-on-expiry`）。
+
+mod antidebug;
+mod cli;
+mod config;
+mod dns;
+mod probe;
+mod report;
+mod tls;
+
+use std::net::SocketAddr;
+use std::process::ExitCode;
+use std::time::Duration;
+
 use clap::Parser;
-use futures_util::StreamExt;
-use reqwest::{Client, Proxy};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use std::fs;
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use x509_parser::prelude::*;
 
-// ==================== 1. 配置文件结构 ====================
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct PinnedConfig {
-    domain: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ip: Option<String>,
-    pin: String,
-    #[serde(default)]
-    expiry: Option<u64>,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    proxy: Option<String>,
-}
+use crate::cli::Args;
+use crate::config::PinnedConfig;
+use crate::probe::{ProbeOutcome, ProbePlan};
 
-const CONFIG_PATH: &str = "pinned-config.json";
-
-#[derive(Parser, Debug)]
-#[command(author, version, about = "终极防 MITM 探针", long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    domain: Option<String>,
-    #[arg(short, long)]
-    ip: Option<String>,
-    #[arg(short, long)]
-    pin: Option<String>,
-    #[arg(short, long)]
-    token: Option<String>,
-    #[arg(short = 'x', long)]
-    proxy: Option<String>,
-    #[arg(long, hide = true)]
-    dev: bool,
-}
-
-// ==================== 2. 反调试逻辑 ====================
-#[cfg(target_os = "windows")]
-fn is_being_debugged() -> bool {
-    use windows::core::BOOL;
-    use windows::Win32::System::Diagnostics::Debug::{
-        CheckRemoteDebuggerPresent, IsDebuggerPresent,
-    };
-    use windows::Win32::System::Threading::GetCurrentProcess;
-
-    let basic_check = unsafe { IsDebuggerPresent() };
-    if basic_check.as_bool() {
-        return true;
-    }
-
-    let mut remote_debugger = BOOL(0);
-    let call_ok =
-        unsafe { CheckRemoteDebuggerPresent(GetCurrentProcess(), &mut remote_debugger) }.is_ok();
-
-    if call_ok {
-        remote_debugger.as_bool()
-    } else {
-        false
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-fn is_being_debugged() -> bool {
-    false
-}
-
-// ==================== 3. 证书校验器 ====================
-#[derive(Debug)]
-struct PinnedVerifier {
-    expected_hash: Vec<u8>,
-    expected_b64: String,
-    captured_data: Mutex<Option<(String, u64)>>,
-}
-
-impl PinnedVerifier {
-    fn new(b64_hash: &str) -> Self {
-        let expected_hash = base64::engine::general_purpose::STANDARD
-            .decode(b64_hash)
-            .unwrap_or_else(|_| Vec::new());
-        Self {
-            expected_hash,
-            expected_b64: b64_hash.to_string(),
-            captured_data: Mutex::new(None),
-        }
-    }
-
-    fn extract_cert_info(cert_der: &[u8]) -> Result<(Vec<u8>, u64), Error> {
-        let (_, cert) = X509Certificate::from_der(cert_der)
-            .map_err(|e| Error::General(format!("X509 parse error: {e}")))?;
-        println!("[!] 捕获到证书 Issuer: {}", cert.issuer);
-        let spki_der = cert.tbs_certificate.subject_pki.raw.to_vec();
-        let not_after = cert.tbs_certificate.validity.not_after;
-        let expiry_ts = not_after.timestamp() as u64;
-        Ok((spki_der, expiry_ts))
-    }
-}
-
-impl ServerCertVerifier for PinnedVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, Error> {
-        let (spki_der, expiry_ts) = Self::extract_cert_info(end_entity.as_ref())?;
-        let mut hasher = Sha256::new();
-        hasher.update(&spki_der);
-        let actual_hash = hasher.finalize();
-        let actual_b64 = base64::engine::general_purpose::STANDARD.encode(actual_hash);
-
-        if let Ok(mut lock) = self.captured_data.lock() {
-            *lock = Some((actual_b64.clone(), expiry_ts));
-        }
-
-        if self.expected_hash.is_empty() || actual_hash.as_slice() == self.expected_hash.as_slice()
-        {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(Error::General(format!(
-                "\n=========================================\n\
-                 🚨 警告：检测到中间人攻击 (MITM)！\n\
-                 预期指纹: {}\n\
-                 实际指纹: {}\n\
-                 =========================================",
-                self.expected_b64, actual_b64
-            )))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &CryptoProvider::get_default()
-                .unwrap()
-                .signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, Error> {
-        verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &CryptoProvider::get_default()
-                .unwrap()
-                .signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        CryptoProvider::get_default()
-            .unwrap()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-// ==================== 4. 智能 DNS 解析器 (DoH) ====================
-async fn resolve_via_doh(
-    domain: &str,
-    proxy_url: Option<&str>,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut builder = Client::builder();
-
-    // 默认使用 Cloudflare 的 DoH
-    let mut doh_url = format!(
-        "https://cloudflare-dns.com/dns-query?ct=application/dns-json&name={}&type=A",
-        domain
-    );
-    let mut bind_host = "cloudflare-dns.com";
-    let mut bind_ip = "1.1.1.1:443";
-
-    if let Some(proxy_str) = proxy_url {
-        let proxy = Proxy::all(proxy_str)?;
-        builder = builder.proxy(proxy);
-        println!("[*] 检测到代理，DNS 请求将通过代理发往 Cloudflare DoH...");
-    } else {
-        doh_url = format!("https://dns.alidns.com/resolve?name={}&type=A", domain);
-        bind_host = "dns.alidns.com";
-        bind_ip = "223.5.5.5:443";
-        println!("[*] 无代理，使用阿里 DoH 直连解析...");
-    }
-
-    let addr: SocketAddr = bind_ip.parse()?;
-    builder = builder.resolve(bind_host, addr);
-
-    let client = builder.build()?;
-
-    let resp: Value = client
-        .get(&doh_url)
-        .header("Accept", "application/dns-json")
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let mut ips = Vec::new();
-    if let Some(answers) = resp["Answer"].as_array() {
-        for ans in answers {
-            if let Some(ip) = ans["data"].as_str() {
-                let type_id = ans["type"].as_u64().unwrap_or(0);
-                if type_id == 1 || type_id == 28 {
-                    // 自动补全端口
-                    ips.push(format!("{}:443", ip));
-                }
-            }
-        }
-    }
-    Ok(ips)
-}
-
-fn resolve_dns_ip_system(domain: &str) -> Vec<String> {
-    let target = format!("{}:443", domain);
-    match target.to_socket_addrs() {
-        Ok(addrs) => addrs.map(|addr| addr.to_string()).collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-async fn smart_resolve(domain: &str, proxy: Option<&str>) -> Vec<String> {
-    match resolve_via_doh(domain, proxy).await {
-        Ok(ips) if !ips.is_empty() => return ips,
-        _ => println!("[-] DoH 解析失败，降级到系统 DNS"),
-    }
-    resolve_dns_ip_system(domain)
-}
-
-// ==================== 5. 配置文件读写与工具 ====================
-fn load_config() -> Option<PinnedConfig> {
-    fs::read_to_string(CONFIG_PATH)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-}
-
-fn save_config(cfg: &PinnedConfig) {
-    if let Ok(json) = serde_json::to_string_pretty(cfg) {
-        if fs::write(CONFIG_PATH, json).is_ok() {
-            println!("[+] 已自动保存配置文件: {}", CONFIG_PATH);
-        }
-    }
-}
-
-fn check_expiry(expiry_ts: u64) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs();
-    if expiry_ts < now {
-        println!("🚨 [严重警告] 证书已过期！请立即更新服务器证书。");
-    } else {
-        let diff = expiry_ts - now;
-        let days = diff / 86400;
-        if days < 7 {
-            println!(
-                "⚠️  [注意] 证书仅剩 {} 天到期 (到期时间: {})",
-                days,
-                format_ts(expiry_ts)
-            );
-        } else {
-            println!("[+] 证书有效期剩余 {} 天", days);
-        }
-    }
-}
-
-fn format_ts(ts: u64) -> String {
-    let dt = UNIX_EPOCH + Duration::from_secs(ts);
-    match dt.duration_since(UNIX_EPOCH) {
-        Ok(d) => format!("Unix {}", d.as_secs()),
-        Err(_) => "Unknown".to_string(),
-    }
-}
-
-fn build_client_with_verifier(
-    domain: &str,
-    ip: Option<&str>,
-    pin_str: &str,
-) -> Result<(Client, Arc<PinnedVerifier>), Box<dyn std::error::Error>> {
-    let verifier = Arc::new(PinnedVerifier::new(pin_str));
-    let tls_config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier.clone())
-        .with_no_client_auth();
-
-    let mut client_builder = Client::builder()
-        .use_preconfigured_tls(tls_config)
-        .tls_built_in_root_certs(false)
-        .no_proxy();
-
-    if let Some(ip_str) = ip {
-        let target_addr: SocketAddr = ip_str
-            .parse()
-            .map_err(|_| format!("无效的 IP 格式: {}，请使用 IP:端口 的格式", ip_str))?;
-        client_builder = client_builder.resolve(domain, target_addr);
-    }
-
-    let client = client_builder.build()?;
-    Ok((client, verifier))
-}
-
-// ==================== 6. 响应处理 ====================
-async fn process_response(
-    resp: Result<reqwest::Response, reqwest::Error>,
-    captured: Option<(String, u64)>,
-    domain: &str,
-    ip: &str,
-    is_first_run: bool,
-    token: Option<String>,
-    proxy: Option<String>,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    match resp {
-        Ok(response) => {
-            let status = response.status();
-            let mut preview = Vec::new();
-            let mut stream = response.bytes_stream();
-
-            while preview.len() < 64 {
-                match stream.next().await {
-                    Some(Ok(chunk)) => {
-                        let needed = 64 - preview.len();
-                        let to_take = std::cmp::min(chunk.len(), needed);
-                        preview.extend_from_slice(&chunk[..to_take]);
-                    }
-                    Some(Err(_)) => break,
-                    None => break,
-                }
-            }
-
-            println!(
-                "[+] 探测成功！Status: {}, 已拉取诱饵数据 (前 {} 字节: {:?})",
-                status,
-                preview.len(),
-                String::from_utf8_lossy(&preview)
-            );
-
-            if let Some((actual_pin, expiry_ts)) = captured {
-                check_expiry(expiry_ts);
-                if is_first_run {
-                    let cfg = PinnedConfig {
-                        domain: domain.to_string(),
-                        ip: Some(ip.to_string()),
-                        pin: actual_pin,
-                        expiry: Some(expiry_ts),
-                        token: token.clone(),
-                        proxy: proxy.clone(),
-                    };
-                    save_config(&cfg);
-                } else {
-                    println!("[+] 指纹校验通过，网络环境安全。");
-                }
-            }
-            Ok(true)
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            if error_msg.contains("Certificate pin mismatch") {
-                println!("[-] 连接失败: {}", e);
-                return Ok(true);
-            }
-            Ok(false)
-        }
-    }
-}
-
-// ==================== 7. 主函数 ====================
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> ExitCode {
     let args = Args::parse();
 
+    // rustls 0.23 要求显式安装加密后端；重复安装会报错，忽略即可。
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     #[cfg(target_os = "windows")]
-    if !args.dev && is_being_debugged() {
+    if !args.dev && antidebug::is_being_debugged() {
+        // 被调试时静默退出，避免指针/配置被直接 dump。
         std::process::exit(0);
     }
 
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("install failed!!!");
+    match run(args).await {
+        Ok(code) => ExitCode::from(code),
+        Err(message) => {
+            eprintln!("[-] {message}");
+            ExitCode::from(report::EXIT_USAGE)
+        }
+    }
+}
 
-    let config = load_config();
+/// 主流程：准备配置 → 选定候选地址 → 探测 → 输出。
+async fn run(args: Args) -> Result<u8, String> {
+    let config_path = PinnedConfig::resolve_path(args.config.clone());
+    let stored = PinnedConfig::load(&config_path)?;
 
-    // 修复：不要 panic，改用优雅的错误提示
-    let domain = match args
+    if args.check {
+        return check(&args, stored.as_ref(), &config_path);
+    }
+
+    let domain = args
         .domain
         .clone()
-        .or_else(|| config.as_ref().map(|c| c.domain.clone()))
-    {
-        Some(d) => d,
-        None => {
-            println!("[-] 缺少目标域名，请通过 -d 提供或配置 pinned-config.json");
-            return Ok(());
-        }
-    };
+        .or_else(|| stored.as_ref().map(|config| config.domain.clone()))
+        .filter(|domain| !domain.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "缺少目标域名：用 -d <域名> 指定，或在 {} 中配置 domain",
+                config_path.display()
+            )
+        })?;
 
-    let current_ip = args
-        .ip
+    let pin = args
+        .pin
         .clone()
-        .or_else(|| config.as_ref().and_then(|c| c.ip.clone()));
+        .or_else(|| stored.as_ref().map(|config| config.pin.clone()))
+        .unwrap_or_default();
+    // 提前校验指纹格式，避免连上之后才因为 Base64 非法而报错。
+    let _ = PinnedConfig::decode_pin(&pin)?;
 
     let token = args
         .token
         .clone()
-        .or_else(|| config.as_ref().and_then(|c| c.token.clone()));
-
+        .or_else(|| stored.as_ref().and_then(|config| config.token.clone()));
     let proxy = args
         .proxy
         .clone()
-        .or_else(|| config.as_ref().and_then(|c| c.proxy.clone()));
+        .or_else(|| stored.as_ref().and_then(|config| config.proxy.clone()));
+    let pinned_ip = args
+        .ip
+        .clone()
+        .or_else(|| stored.as_ref().and_then(|config| config.ip.clone()));
 
-    let (pin_str, is_first_run) = if let Some(cmd_pin) = &args.pin {
-        (cmd_pin.clone(), false)
-    } else if let Some(cfg) = &config {
-        (cfg.pin.clone(), false)
-    } else {
-        (String::new(), true)
+    let timeout = Duration::from_secs(args.timeout);
+    let mut tried: Vec<String> = Vec::new();
+    let mut last_error = String::new();
+    let mut outcome: Option<(ProbeOutcome, SocketAddr)> = None;
+
+    // 第一阶段：强绑 IP（配置里固定过的地址优先）。
+    if let Some(raw_ip) = pinned_ip.as_deref() {
+        let target = parse_target(raw_ip)?;
+        tried.push(target.to_string());
+        let result = probe::probe(&ProbePlan {
+            domain: domain.clone(),
+            target,
+            pin: pin.clone(),
+            token: token.clone(),
+            timeout,
+            retries: args.retries,
+        })
+        .await;
+
+        if !matches!(result, ProbeOutcome::Failed { .. }) {
+            outcome = Some((result, target));
+        } else if let ProbeOutcome::Failed { error } = &result {
+            last_error = error.clone();
+        }
+    }
+
+    // 第二阶段：DNS 降级（--no-fallback 或已命中时跳过）。
+    if outcome.is_none() && !args.no_fallback {
+        let candidates = dns::resolve(&domain, proxy.as_deref(), args.doh.as_deref()).await;
+        for target in candidates {
+            if tried.iter().any(|entry| entry == &target.to_string()) {
+                continue;
+            }
+            tried.push(target.to_string());
+            let result = probe::probe(&ProbePlan {
+                domain: domain.clone(),
+                target,
+                pin: pin.clone(),
+                token: token.clone(),
+                timeout,
+                retries: args.retries,
+            })
+            .await;
+
+            if matches!(result, ProbeOutcome::Failed { .. }) {
+                if let ProbeOutcome::Failed { error } = &result {
+                    last_error = error.clone();
+                }
+                continue;
+            }
+            outcome = Some((result, target));
+            break;
+        }
+    }
+
+    let (outcome, target) = match outcome {
+        Some(pair) => pair,
+        None => {
+            let report = report::unreachable(&domain, tried, last_error);
+            report.emit(&args);
+            return Ok(report::EXIT_UNREACHABLE);
+        }
     };
 
-    let url = format!("https://{}/", domain);
+    let report = report::from_outcome(&domain, target, &outcome, &pin);
+    report.emit(&args);
 
-    // ==================== 第一阶段：强绑 IP ====================
-    if let Some(ip_str) = &current_ip {
-        println!("[*] 探测目标: {} -> {}", domain, ip_str);
-        let (client, verifier) = build_client_with_verifier(&domain, Some(ip_str), &pin_str)?;
-
-        let mut req = client.get(&url);
-        if let Some(t) = &token {
-            req = req.header("X-Probe-Token", t);
-        }
-
-        let resp = req.send().await;
-        let captured = verifier.captured_data.lock().ok().and_then(|g| g.clone());
-
-        if process_response(
-            resp,
-            captured,
-            &domain,
-            ip_str,
-            is_first_run,
-            token.clone(),
-            proxy.clone(),
-        )
-        .await?
-        {
-            return Ok(());
-        }
-        println!("[!] 强绑 IP 连接失败, 正在尝试 DNS 降级解析...");
-    }
-
-    // ==================== 第二阶段：智能 DNS 降级 ====================
-    println!("[*] 尝试通过智能 DoH 解析 {} 的新 IP...", domain);
-    let new_ips = smart_resolve(&domain, proxy.as_deref()).await;
-
-    if new_ips.is_empty() {
-        println!("[-] DNS 解析失败，无法降级。");
-        return Ok(());
-    }
-
-    println!("[+] DNS 解析成功，获得 {} 个候选 IP", new_ips.len());
-
-    for ip_candidate in new_ips {
-        println!("[*] 正在尝试: {} -> {}", domain, ip_candidate);
-
-        let (client, verifier) =
-            match build_client_with_verifier(&domain, Some(&ip_candidate), &pin_str) {
-                Ok(res) => res,
-                Err(e) => {
-                    println!("[-] 构建客户端失败: {}", e);
-                    continue;
-                }
+    // 首次运行（没有固定指纹）时把观测到的指纹落盘，形成 TOFU 基线。
+    if matches!(outcome, ProbeOutcome::Tofu { .. }) {
+        if let Some(cert) = outcome.cert() {
+            let config = PinnedConfig {
+                domain: domain.clone(),
+                ip: Some(target.to_string()),
+                pin: cert.pin_b64.clone(),
+                expiry: Some(cert.not_after),
+                token: token.clone(),
+                proxy: proxy.clone(),
             };
-
-        let mut req = client.get(&url);
-        if let Some(t) = &token {
-            req = req.header("X-Probe-Token", t);
-        }
-
-        let resp = req.send().await;
-        let captured = verifier.captured_data.lock().ok().and_then(|g| g.clone());
-
-        if process_response(
-            resp,
-            captured,
-            &domain,
-            &ip_candidate,
-            is_first_run,
-            token.clone(),
-            proxy.clone(),
-        )
-        .await?
-        {
-            return Ok(());
+            match config.save(&config_path) {
+                Ok(()) => report::note(&format!("已把本次指纹写入 {}", config_path.display())),
+                Err(e) => report::note(&format!("指纹保存失败（{e}），请手动写入配置")),
+            }
         }
     }
 
-    println!("[-] 所有候选 IP 均连接失败。");
-    Ok(())
+    // 指纹不匹配：只有显式 --accept-new-pin 才更新配置（正常换证场景）。
+    if matches!(outcome, ProbeOutcome::Mitm { .. }) && args.accept_new_pin {
+        if let Some(cert) = outcome.cert() {
+            let config = PinnedConfig {
+                domain: domain.clone(),
+                ip: Some(target.to_string()),
+                pin: cert.pin_b64.clone(),
+                expiry: Some(cert.not_after),
+                token: token.clone(),
+                proxy: proxy.clone(),
+            };
+            config.save(&config_path)?;
+            report::note(&format!(
+                "已按 --accept-new-pin 更新指纹（{}）",
+                config_path.display()
+            ));
+            return Ok(report::EXIT_OK);
+        }
+    }
+
+    Ok(report.exit_code(&args))
+}
+
+/// `--check`：只校验配置与指纹格式，不发起网络请求。
+fn check(args: &Args, stored: Option<&PinnedConfig>, path: &std::path::Path) -> Result<u8, String> {
+    println!("[*] 配置文件: {}", path.display());
+
+    let config = match stored {
+        Some(config) => config.clone(),
+        None => {
+            println!("[!] 配置文件不存在（首次运行会自动创建）");
+            PinnedConfig {
+                domain: args.domain.clone().unwrap_or_default(),
+                pin: args.pin.clone().unwrap_or_default(),
+                ..PinnedConfig::default()
+            }
+        }
+    };
+
+    if config.domain.is_empty() {
+        return Err("配置缺少 domain（用 -d 指定或写进配置文件）".to_string());
+    }
+    println!("[+] 目标域名: {}", config.domain);
+
+    if config.pin.is_empty() {
+        println!("[!] 尚未固定指纹：下次运行会以 TOFU 方式记录");
+    } else {
+        let pin = PinnedConfig::decode_pin(&config.pin)?;
+        println!("[+] 指纹格式有效（SHA-256 / {} 字节）", pin.len());
+    }
+
+    if let Some(ip) = &config.ip {
+        let target = parse_target(ip)?;
+        println!("[+] 固定地址: {target}");
+    }
+    if let Some(proxy) = &config.proxy {
+        println!("[*] DoH 代理: {proxy}");
+    }
+    println!("[+] 配置校验通过");
+    Ok(report::EXIT_OK)
+}
+
+/// 解析 `IP` 或 `IP:端口`（默认 443）。
+fn parse_target(value: &str) -> Result<SocketAddr, String> {
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    if let Ok(ip) = value.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, 443));
+    }
+    Err(format!(
+        "无效的地址 {value}，应为 1.2.3.4 或 1.2.3.4:443（IPv6 用 [::1]:443）"
+    ))
 }
